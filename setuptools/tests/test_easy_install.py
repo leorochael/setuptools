@@ -5,6 +5,7 @@ from __future__ import absolute_import
 
 import sys
 import os
+import os.path
 import tempfile
 import site
 import contextlib
@@ -13,6 +14,7 @@ import logging
 import itertools
 import distutils.errors
 import io
+import subprocess
 import zipfile
 from unittest import mock
 
@@ -29,6 +31,7 @@ from setuptools.command import easy_install as easy_install_pkg
 from setuptools.dist import Distribution
 from pkg_resources import normalize_path, working_set
 from pkg_resources import Distribution as PRDistribution
+from pkg_resources import PY_MAJOR
 import setuptools.tests.server
 import pkg_resources
 
@@ -157,14 +160,11 @@ class TestEasyInstallTest:
             ),
         ]
         sdist_name = 'setuptools-test-unicode-1.0.zip'
-        sdist = tmpdir / sdist_name
-        # can't use make_sdist, because the issue only occurs
+        sdist = str(tmpdir / sdist_name)
+        # can't use make_tgz, because the issue only occurs
         #  with zip sdists.
-        sdist_zip = zipfile.ZipFile(str(sdist), 'w')
-        for filename, content in files:
-            sdist_zip.writestr(filename, content)
-        sdist_zip.close()
-        return str(sdist)
+        make_zip(sdist, files)
+        return sdist
 
     def test_unicode_filename_in_sdist(self, sdist_unicode, tmpdir, monkeypatch):
         """
@@ -303,6 +303,194 @@ class TestUserInstallTest:
             self.user_install_setup_context,
         )
 
+@pytest.mark.usefixtures("user_override")
+class TestEasyInstallMainToDirectory:
+
+    dist_name = "myorg.mypackage"
+    dist_version = "1.0"
+    dist_name_version = "%s-%s" % (dist_name, dist_version)
+    egg_basename = "%s-py%s.egg" % (dist_name_version, PY_MAJOR)
+    egg_platform_basename = "%s-py%s-%s.egg" % (
+        dist_name_version, PY_MAJOR, pkg_resources.get_build_platform(),
+    )
+
+    def sdist(self, tmpdir, suffix, method):
+        src_dir = tmpdir.mkdir("src")
+        sdist = tmpdir / (self.dist_name_version + suffix)
+
+        make_nspkg_sdist(
+            str(sdist),
+            self.dist_name,
+            self.dist_version,
+            method=method,
+        )
+        return sdist
+
+    @pytest.fixture
+    def sdist_tgz(self, tmpdir):
+        return self.sdist(tmpdir, suffix=".tar.gz", method=make_tgz)
+
+    @pytest.fixture
+    def sdist_zip(self, tmpdir):
+        return self.sdist(tmpdir, suffix=".zip", method=make_zip)
+
+    @pytest.fixture
+    def sdist_dir(self, tmpdir):
+        return self.sdist(tmpdir, suffix="", method=make_tree)
+
+    @pytest.fixture
+    def dist_setup(self, sdist_dir):
+        from distutils.core import run_setup as du_run_setup
+
+        def dist_setup(dist_cmd, stop_after="run", run_after=lambda dist: None):
+            with sdist_dir.as_cwd():
+                dist = du_run_setup(
+                    str(sdist_dir/"setup.py"),
+                    [dist_cmd],
+                )
+                run_after(dist)
+                [bdist] = [
+                    sdist_dir / filename
+                    for cmd, pyversion, filename in dist.dist_files
+                    if cmd == dist_cmd
+                ]
+            return bdist
+
+        return dist_setup
+
+    @pytest.fixture
+    def index_dir(self, tmpdir):
+        return tmpdir.mkdir("index")
+
+    @pytest.fixture
+    def index_dist_page(self, index_dir):
+        return index_dir.mkdir(self.dist_name)
+
+    @pytest.fixture
+    def check(self, index_dir, tmpdir):
+        install_dir = (tmpdir/"eggs")
+        install_dir.mkdir()
+        argv = [
+            '-mZNxqq',
+            '-i', str(index_dir),
+            '-d', str(install_dir),
+        ]
+
+        def check():
+            pi = setuptools.package_index.PackageIndex(str(index_dir))
+            requirement = pkg_resources.Requirement.parse(self.dist_name)
+            pi.find_packages(requirement)
+            assert len(pi[self.dist_name]) == 1, pi
+
+            ei.main(argv + [self.dist_name])
+            expected_locations = set([
+                install_dir/self.egg_basename,
+                install_dir/self.egg_platform_basename,
+            ])
+            [expected_location] = expected_locations.intersection(
+                install_dir.listdir())
+            pkg_env = pkg_resources.Environment([str(expected_location)])
+            [installed_dist] = pkg_env[self.dist_name]
+            assert installed_dist.version == self.dist_version
+
+        return check
+
+    def test_sdist_tgz_install(self, index_dist_page, check, sdist_tgz):
+        # install from source tgz on index
+        sdist_tgz.copy(index_dist_page)
+
+        check()
+
+    def test_sdist_zip_install(self, index_dist_page, check, sdist_zip):
+        # install from source zip on index
+        sdist_zip.copy(index_dist_page)
+
+        check()
+
+    def test_egg_install(self, index_dist_page, check, dist_setup):
+        # install from egg on index:
+        dist_filename = dist_setup("bdist_egg")
+
+        index_dist_egg = index_dist_page/self.egg_basename
+        dist_filename.copy(index_dist_page)
+        assert zipfile.is_zipfile(str(index_dist_egg))
+
+        check()
+
+    def test_wininst_install(self, index_dist_page, check, dist_setup,
+                             monkeypatch):
+        # build wininst:
+        from setuptools.command.bdist_wininst import bdist_wininst
+
+        class bdist_wininst_patched(bdist_wininst):
+            def get_exe_bytes(self):
+                """We are not going to execute the installer wrapper"""
+                return b''
+            def get_inidata(self):
+                """Avoid attempt by create_exe() to encode cfgdata as 'mbcs'
+                which doesn't exist on nixes"""
+                cfgdata = bdist_wininst.get_inidata(self)
+                if not isinstance(cfgdata, bytes):
+                    cfgdata = cfgdata.encode('ascii')
+                return cfgdata
+
+        def run_wininst(dist):
+            cmd = bdist_wininst_patched(dist)
+            cmd.target_version = PY_MAJOR
+            cmd.ensure_finalized()
+            cmd.run()
+
+        dist_filename = dist_setup(
+            "bdist_wininst",
+            stop_after="cmdline",
+            run_after=run_wininst,
+        )
+
+        # copy wininst to index:
+        index_dist_wininst = index_dist_page/dist_filename.basename
+        dist_filename.copy(index_dist_wininst)
+        assert zipfile.is_zipfile(str(index_dist_wininst))
+
+        def parse_bdist_wininst(name):
+            """The original checks against specific platforms like:
+                win-amd64 and win32, instead of parsing the platform from the
+                file, but the fake wininst will match the current platform
+            """
+            name, _ = os.path.splitext(name)
+            base_plat, py_ver = name.rsplit("-", 1)
+            assert py_ver.startswith("py")
+            py_ver = py_ver[2:]
+            base, plat = base_plat.rsplit(".", 1)
+            return base, py_ver, plat
+
+        monkeypatch.setattr(
+            'setuptools.package_index.parse_bdist_wininst',
+            parse_bdist_wininst,
+        )
+        check()
+
+    @mock.patch('distutils.core.DEBUG', True)
+    def test_wheel_install(self, index_dist_page, check, sdist_dir):
+        # build wheel:
+        from distutils.core import run_setup as du_run_setup
+        from wheel.bdist_wheel import bdist_wheel
+        with sdist_dir.as_cwd():
+            dist = du_run_setup(
+                str(sdist_dir/"setup.py"),
+                ["build"],
+                "commandline",
+            )
+            cmd = bdist_wheel(dist)
+            cmd.universal = True
+            cmd.ensure_finalized()
+            cmd.run()
+        # copy wheel to index:
+        wheel_basename = self.dist_name_version + "-py2.py3-none-any.whl"
+        index_dist_wheel = index_dist_page/wheel_basename
+        (sdist_dir/"dist"/wheel_basename).copy(index_dist_page)
+        assert zipfile.is_zipfile(str(index_dist_page/wheel_basename))
+
+        check()
 
 @pytest.yield_fixture
 def distutils_package():
@@ -368,7 +556,7 @@ class TestSetupRequires:
         """
         with contexts.tempdir() as dir:
             dist_path = os.path.join(dir, 'setuptools-test-fetcher-1.0.tar.gz')
-            make_sdist(dist_path, [
+            make_tgz(dist_path, [
                 ('setup.py', DALS("""
                     import setuptools
                     setuptools.setup(
@@ -463,13 +651,54 @@ class TestSetupRequires:
                 assert lines[-1].strip() == 'test_pkg'
 
 
-def make_trivial_sdist(dist_path, distname, version):
+def make_tgz(dist_path, files):
+    """
+    Create a simple sdist tarball at dist_path, containing the files
+    listed in ``files`` as ``(filename, content)`` tuples.
+    """
+
+    with tarfile_open(dist_path, 'w:gz') as dist:
+        for filename, content in files:
+            file_bytes = io.BytesIO(content.encode('utf-8'))
+            file_info = tarfile.TarInfo(name=filename)
+            file_info.size = len(file_bytes.getvalue())
+            file_info.mtime = int(time.time())
+            dist.addfile(file_info, fileobj=file_bytes)
+
+
+def make_zip(zip_path, files):
+    """
+    Create a simple zip file at zip_path, containing the files
+    listed in ``files`` as ``(filename, content)`` tuples.
+    """
+    with zipfile.ZipFile(zip_path, 'w') as zip_package:
+        for filename, content in files:
+            zip_package.writestr(filename, content)
+        zip_package.close()
+
+
+def make_tree(path, files):
+    """
+    Create a directory tree, containing the files
+    listed in ``files`` as ``(filename, content)`` tuples.
+    """
+    os.mkdir(path)
+    for filename, content in files:
+        fullpath = os.path.join(path, filename)
+        dirpath = os.path.dirname(fullpath)
+        if not os.path.isdir(dirpath):
+            os.makedirs(os.path.dirname(fullpath))
+        with open(fullpath, "wb") as f:
+            f.write(content.encode('utf-8'))
+
+
+def make_trivial_sdist(dist_path, distname, version, method=make_tgz):
     """
     Create a simple sdist tarball at dist_path, containing just a simple
     setup.py.
     """
 
-    make_sdist(dist_path, [
+    method(dist_path, [
         ('setup.py',
          DALS("""\
              import setuptools
@@ -480,7 +709,7 @@ def make_trivial_sdist(dist_path, distname, version):
          """ % (distname, version)))])
 
 
-def make_nspkg_sdist(dist_path, distname, version):
+def make_nspkg_sdist(dist_path, distname, version, method=make_tgz):
     """
     Make an sdist tarball with distname and version which also contains one
     package with the same name as distname.  The top-level package is
@@ -510,22 +739,7 @@ def make_nspkg_sdist(dist_path, distname, version):
         filename = os.path.join(*(package.split('.') + ['__init__.py']))
         files.append((filename, ''))
 
-    make_sdist(dist_path, files)
-
-
-def make_sdist(dist_path, files):
-    """
-    Create a simple sdist tarball at dist_path, containing the files
-    listed in ``files`` as ``(filename, content)`` tuples.
-    """
-
-    with tarfile_open(dist_path, 'w:gz') as dist:
-        for filename, content in files:
-            file_bytes = io.BytesIO(content.encode('utf-8'))
-            file_info = tarfile.TarInfo(name=filename)
-            file_info.size = len(file_bytes.getvalue())
-            file_info.mtime = int(time.time())
-            dist.addfile(file_info, fileobj=file_bytes)
+    method(dist_path, files)
 
 
 def create_setup_requires_package(path, distname='foobar', version='0.1',
@@ -563,18 +777,6 @@ def create_setup_requires_package(path, distname='foobar', version='0.1',
     make_package(foobar_path, distname, version)
 
     return test_pkg
-
-
-def make_trivial_sdist(dist_path, setup_py):
-    """Create a simple sdist tarball at dist_path, containing just a
-    setup.py, the contents of which are provided by the setup_py string.
-    """
-
-    setup_py_file = tarfile.TarInfo(name='setup.py')
-    setup_py_bytes = io.BytesIO(setup_py.encode('utf-8'))
-    setup_py_file.size = len(setup_py_bytes.getvalue())
-    with tarfile_open(dist_path, 'w:gz') as dist:
-        dist.addfile(setup_py_file, fileobj=setup_py_bytes)
 
 
 @pytest.mark.skipif(

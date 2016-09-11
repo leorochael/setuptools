@@ -180,6 +180,11 @@ setup_params = dict(
         ),
     ],
     scripts=[],
+    tests_require=[
+        'setuptools[ssl]',
+        'pytest-flake8',
+        'pytest>=2.8,<3',
+    ] + (['mock'] if sys.version_info[:2] < (3, 3) else []),
     setup_requires=[
     ] + wheel,
 )
